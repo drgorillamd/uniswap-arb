@@ -1,10 +1,9 @@
+const { BigNumber } = require("@ethersproject/bignumber");
 const { ethers, waffle } = require("hardhat");
 require('dotenv').config;
 
 const DAI =  '0x6b175474e89094c44da98b954eedeac495271d0f';
-const WETH = '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2'; // dai<weth->dai is token0
-const UNI2_ROUTER = ''; //used for getAmountIn and Out -> idnependent of dex
-//home = WETH
+const WETH = '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2'; // dai<weth -> dai is token0
 
 const addresses = {
     'UniswapV2': '0xa478c2975ab1ea89e8196811f51a7b7ade33eb11',
@@ -14,14 +13,9 @@ const addresses = {
     'Croswap': '0x60a26d69263ef43e9a68964ba141263f19d71d51'};
 
 const abiPool = ["function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)"];
-
-const abiUniMath = ["function getAmountOut(uint amountIn, uint reserveIn, uint reserveOut) public pure virtual override returns (uint amountOut)",
-"function getAmountIn(uint amountOut, uint reserveIn, uint reserveOut) public pure virtual override returns (uint amountIn)"]
-
-const abiSwapRelay = ["function execArb(address firstPool, address secondPool, uint256 amountDaiOut, uint256 amountEthOut) external payable returns(uint256)"];
-
 const provider = waffle.provider;
 
+const GWEI = ethers.BigNumber.from(10).pow(18);
 
 async function main() {
     // -- init --
@@ -29,9 +23,9 @@ async function main() {
     for (const [dex, adr] of Object.entries(addresses)) {
         contracts[dex]=new ethers.Contract(adr, abiPool, provider);
     }
-    const quoteOut = new ethers.Contract(UNI2_ROUTER, abiUniMath, provider);
 
-    const swapRelay = new ethers.Contract(abiSwapRelay, provider);
+    const Contract = await ethers.getContractFactory("ExecArb", provider);
+    const ExecArb = await Contract.deploy();
 
     const [deployer] = await ethers.getSigners();
 
@@ -41,44 +35,50 @@ async function main() {
         let prices = {};
         let reserves = {};
         for (const [dex, contract] of Object.entries(contracts)) {
-            const [reserve0, reserve1] = await contract.getReserves();           
-            const curr_price = reserve0.div(reserve1);
-            prices[dex] = curr_price;
-            reserves[dex] = [reserve0, reserve1];
-            console.log(dex+" : "+prices[dex].toString());
-            console.log(dex+" "+reserves[dex]);
+            const [reserveDai, reserveWeth] = await contract.getReserves();           
+            const curr_price = reserveDai.div(reserveWeth);
+            prices[dex] = curr_price.toNumber();
+            reserves[dex] = [reserveDai, reserveWeth];
         }
 
-        const sorted_prices = Object.fromEntries(
-            Object.entries(prices).sort(([,a],[,b]) => a-b)
-        );
+        const pricesArr = Object.values(prices);
+        const dexIn = Object.keys(prices).find(key => prices[key] === Math.max(...pricesArr)); //eth cost more here -> we start from eth
+        const dexOut = Object.keys(prices).find(key => prices[key] === Math.min(...pricesArr)); //eth is trading at discount here/min price
 
-        // assuming other pools are pure clone, with the same flat fees as uniswap
-        console.log(sorted_prices);
+        const [reserve_Dai_firstPool, reserve_Weth_firstPool] = reserves[dexIn];
+        const [reserve_Dai_secondPool, reserve_Weth_secondPool] = reserves[dexOut];
 
-        // -- payload :
-        // -- first leg: ETH->DAI 
+        console.log("In : "+dexIn+"@"+prices[dexIn]+" reserves :"+reserve_Dai_firstPool+" dai - eth "+reserve_Weth_firstPool);
+        console.log("Out : "+dexOut+"@"+prices[dexOut]+" reserves :"+reserve_Dai_secondPool+" dai - eth "+reserve_Weth_secondPool);
+
+        //computing first leg, eth to dai:
+        //how much dai to take the biggest spread ?
+        //params : truePriceDai, truePriceEth, reserveDai, reserveEth
+        const [AToB, amountInDai] = await ExecArb.computeProfitMaximizingTrade(prices[dexOut], 1, reserve_Dai_firstPool, reserve_Weth_firstPool);
+        console.log("Amount of DAI received : "+amountInDai.div(GWEI).toString()+" A to B"+AToB);
         
+        const numerator = reserve_Weth_firstPool.mul(amountInDai).mul(1000);
+        const denominator = reserve_Dai_firstPool.sub(amountInDai).mul(997);
+        const amountInEth = numerator.div(denominator).add(1);
 
-        quoteOut.getAmountsOut
-        quoteOut.getAmountsIn
+        console.log("corresponding to "+amountInEth.toString()+" eth swapped in first pool");
 
-        execArb(in, out, amount, {value: amount})
+        //computing second leg, dai to eth:
+        const amountInWithFee = amountInDai.mul(997);
+        const num = amountInWithFee.mul(reserve_Weth_secondPool);
+        const denom = reserve_Dai_secondPool.mul(1000).add(amountInWithFee);
+        const amountOutEth = num.div(denom);
 
-        sell prices[n-1]
-        buy prices[0]
+        console.log("for "+amountOutEth.toString()+" eth received from second pool");
+  
+        const overrides = {value: amountInEth};
+        const DaiToEth = await ExecArb.callStatic.execArb(contracts[dexIn].address, contracts[dexOut].address, amountInDai, amountOutEth, overrides);
+        console.log("simulated eth from closing second leg: "+DaiToEth.toString());
 
-        
-        let minPrice = 2**256;
-        let maxPrice = 0;
-
-        //delete price[dex];
     } catch (e) {
         console.log(e);
     }
 }
-
-// [_reserve0, _reserve1, lastTs] = pair.getReserves();
 
 /* sort by asc order
  arb the extrema, pop(extrema), arb extrema  --  if 2 price identical, take the biggest liq

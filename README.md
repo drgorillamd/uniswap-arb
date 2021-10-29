@@ -31,4 +31,5 @@ the use of a weth flashloan and/or dai flashmint while running in prod.
 - The opportunities are based on mined tx -> lsitening to namedEvent 'pending' in ethers to
 get the swap waiting in txpool would give another extra hedge (the ideal situation would then
 be getting included as the LAST tx from the block, effectively frontrunning the following block)
-- 
+- Safety check -> pass the prices observed by the bot to execArb, revert (+/- recompute) if
+huge difference (avoid loosing when being too slow)
