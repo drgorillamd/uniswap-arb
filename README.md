@@ -6,7 +6,7 @@
 Tests need to be run on a fork of ethereum mainnet, via :
 
     npm i
-    npx hardhat test
+    npx hardhat run scripts/index.js
     
 
 Exploit arbitrage opportunities between the following dex, on the weth-dai pair :
