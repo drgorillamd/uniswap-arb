@@ -1,5 +1,5 @@
-const { BigNumber } = require("@ethersproject/bignumber");
 const { ethers, waffle } = require("hardhat");
+const fetch = require('node-fetch');
 require('dotenv').config;
 
 const DAI =  '0x6b175474e89094c44da98b954eedeac495271d0f';
@@ -17,21 +17,22 @@ const provider = waffle.provider;
 
 const GWEI = ethers.BigNumber.from(10).pow(18);
 
+
 async function main() {
     // -- init --
     let contracts = {};
     for (const [dex, adr] of Object.entries(addresses)) {
         contracts[dex]=new ethers.Contract(adr, abiPool, provider);
     }
-
     const Contract = await ethers.getContractFactory("ExecArb", provider);
     const ExecArb = await Contract.deploy();
+    const [signer] = await ethers.getSigners();
 
-    const [deployer] = await ethers.getSigners();
 
-    // -- in live, provider.on('mined') starts here, looking for arb after each new block
+    // In live, provider.on('mined') starts here, looking for arb after each new block
+    // (hardhat node doesn't provide such rpc endpoint)
     try {
-        // --get prices and sort them --
+        // Get prices from each pool and sort them
         let prices = {};
         let reserves = {};
         for (const [dex, contract] of Object.entries(contracts)) {
@@ -41,52 +42,83 @@ async function main() {
             reserves[dex] = [reserveDai, reserveWeth];
         }
 
-        const pricesArr = Object.values(prices);
-        const dexIn = Object.keys(prices).find(key => prices[key] === Math.max(...pricesArr)); //eth cost more here -> we start from eth
-        const dexOut = Object.keys(prices).find(key => prices[key] === Math.min(...pricesArr)); //eth is trading at discount here/min price
+        const pricesSortedArr = Object.values(prices);
+        pricesSortedArr.sort().reverse();
 
-        const [reserve_Dai_firstPool, reserve_Weth_firstPool] = reserves[dexIn];
-        const [reserve_Dai_secondPool, reserve_Weth_secondPool] = reserves[dexOut];
+        let maxProfit = {maxEthReceived: 0, gas: 0, firstLeg: null, secondLeg: null};
 
-        console.log("In : "+dexIn+"@"+prices[dexIn]+" reserves :"+reserve_Dai_firstPool+" dai - eth "+reserve_Weth_firstPool);
-        console.log("Out : "+dexOut+"@"+prices[dexOut]+" reserves :"+reserve_Dai_secondPool+" dai - eth "+reserve_Weth_secondPool);
-
-        //computing first leg, eth to dai:
-        //how much dai to take the biggest spread ?
-        //params : truePriceDai, truePriceEth, reserveDai, reserveEth
-        const [AToB, amountInDai] = await ExecArb.computeProfitMaximizingTrade(prices[dexOut], 1, reserve_Dai_firstPool, reserve_Weth_firstPool);
-        console.log("Amount of DAI received : "+amountInDai.div(GWEI).toString()+" A to B"+AToB);
+        // Try every possible arb, from ETH to ETH (ie we a potential ev+, since the nested for
+        // only goes from "expensive to cheap eth" (other direction, when starting 
+        // from eth, is a buy expensive DAI/sell cheap DAI - EV neg)
         
-        const numerator = reserve_Weth_firstPool.mul(amountInDai).mul(1000);
-        const denominator = reserve_Dai_firstPool.sub(amountInDai).mul(997);
-        const amountInEth = numerator.div(denominator).add(1);
+        for(let firstLeg=0; firstLeg<5; firstLeg++) {
+            for(let secondLeg=firstLeg+1; secondLeg<5; secondLeg++) {
+                const currentFirstPool = Object.keys(prices).find(key => prices[key] === pricesSortedArr[firstLeg]);
+                const currentSecondPool = Object.keys(prices).find(key => prices[key] === pricesSortedArr[secondLeg]);
 
-        console.log("corresponding to "+amountInEth.toString()+" eth swapped in first pool");
+                console.log("Checking "+currentFirstPool+"@"+prices[currentFirstPool]+"->"+currentSecondPool+"@"+prices[currentSecondPool]);
 
-        //computing second leg, dai to eth:
-        const amountInWithFee = amountInDai.mul(997);
-        const num = amountInWithFee.mul(reserve_Weth_secondPool);
-        const denom = reserve_Dai_secondPool.mul(1000).add(amountInWithFee);
-        const amountOutEth = num.div(denom);
+                const {eth_received, gas} = await simArb(currentFirstPool, currentSecondPool);
 
-        console.log("for "+amountOutEth.toString()+" eth received from second pool");
-  
-        const overrides = {value: amountInEth};
-        const DaiToEth = await ExecArb.callStatic.execArb(contracts[dexIn].address, contracts[dexOut].address, amountInDai, amountOutEth, overrides);
-        console.log("simulated eth from closing second leg: "+DaiToEth.toString());
+                if(eth_received > maxProfit.maxEthReceived) {
+                    maxProfit.maxEthReceived = eth_received;
+                    maxProfit.gas = gas;
+                    maxProfit.firstLeg = currentFirstPool;
+                    maxProfit.secondLeg = currentSecondPool;
+                    console.log("New max : from "+currentFirstPool+" to "+currentSecondPool+"; delta : "+curr_profit);
+                }
+            }
+        }
+
+        //current gas price (returns maxTotalFee)
+        const gas_api = await fetch("https://www.etherchain.org/api/gasnow");
+        const gas_api_response = await gas_api.json();
+        const fast_gas = gas_api_response.data.rapid;
+
+        // is the max profit really EV+ when taking gas into account ?
+        if(maxProfit.maxEthReceived>maxProfit.gas*fast_gas) {
+            const net_profit = maxProfit.maxEthReceived - gas*fast_gas;
+            console.log("Arb : "+maxProfit.firstLeg+" -> "+maxProfit.secondLeg+" - NET PROFIT :"+net_profit);
+        } else console.log("no free lunch atm");
+
+
+        
+        async function simArb(currentFirstPool, currentSecondPool) {
+            const [reserve_Dai_firstPool, reserve_Weth_firstPool] = reserves[currentFirstPool];
+            const [reserve_Dai_secondPool, reserve_Weth_secondPool] = reserves[currentSecondPool];
+            const priceOut = prices[currentSecondPool];
+                
+            // -- computing first leg, eth to dai: --
+
+            //how much dai to take the biggest spread ?
+            //params : truePriceDai, truePriceEth, reserveDai, reserveEth
+            const amountDai = await ExecArb.computeProfitMaximizingTrade(priceOut, 1, reserve_Dai_firstPool, reserve_Weth_firstPool);
+            if(amountDai == 0) return 0;
+            
+            //how much eth needs to get swapped in first pool to get there ?
+            const numerator = reserve_Weth_firstPool.mul(amountDai).mul(1000);
+            const denominator = reserve_Dai_firstPool.sub(amountDai).mul(997); // uni fee
+            const amountInEth = numerator.div(denominator).add(1);
+    
+            // -- computing second leg, dai to eth: --
+            // how much eth would we get from swapping dai from first leg into the second pool ?
+            const amountInWithFee = amountDai.mul(997); //fee
+            const num = amountInWithFee.mul(reserve_Weth_secondPool);
+            const denom = reserve_Dai_secondPool.mul(1000).add(amountInWithFee);
+            const amountOutEth = num.div(denom);
+        
+            // static call to simulate the actual arb + estimate the gas consumption
+            const DaiToEth = await ExecArb.callStatic.execArb(contracts[currentFirstPool].address, contracts[currentSecondPool].address, amountDai, amountOutEth, {value: amountInEth});
+            const gasEstim = await ExecArb.estimateGas.execArb(contracts[currentFirstPool].address, contracts[currentSecondPool].address, amountDai, amountOutEth, {value: amountInEth});
+            console.log("simulated eth from closing second leg: "+DaiToEth);
+        
+            return amountOutEth.sub(amountInEth), gasEstim;
+        }
 
     } catch (e) {
         console.log(e);
     }
 }
-
-/* sort by asc order
- arb the extrema, pop(extrema), arb extrema  --  if 2 price identical, take the biggest liq
- max slippage = target price !
- transfer in to pair
- pair.swap */
-
-
 
 main()
   .then(() => process.exit(0))

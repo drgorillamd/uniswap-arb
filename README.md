@@ -32,4 +32,6 @@ the use of a weth flashloan and/or dai flashmint while running in prod.
 get the swap waiting in txpool would give another extra hedge (the ideal situation would then
 be getting included as the LAST tx from the block, effectively frontrunning the following block)
 - Safety check -> pass the prices observed by the bot to execArb, revert (+/- recompute) if
-huge difference (avoid loosing when being too slow)
+huge difference (avoid loosing when being frontran)
+- CompureMaximizedProfit should be adapted in JS, avoiding waisint gtime waiting for a promise
+to resove
